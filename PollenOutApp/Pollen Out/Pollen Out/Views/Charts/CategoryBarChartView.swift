@@ -57,13 +57,14 @@ struct CategoryBarChartView: View {
             .overlay {
                 VStack(spacing: 0) {
                     GeometryReader { proxy in
+                        let fillWidth = proxy.size.width * CGFloat(clampedFillRatio)
                         ZStack(alignment: .leading) {
                             LinearGradient(
                                 colors: scalePalette,
                                 startPoint: .leading,
                                 endPoint: .trailing
                             )
-                            .opacity(0.34)
+                            .opacity(0.24)
 
                             RoundedRectangle(cornerRadius: 0, style: .continuous)
                                 .fill(
@@ -73,19 +74,57 @@ struct CategoryBarChartView: View {
                                         endPoint: .trailing
                                     )
                                 )
-                                .frame(width: proxy.size.width * CGFloat(clampedFillRatio))
+                                .frame(width: fillWidth)
+                                .saturation(1.22)
+                                .overlay(alignment: .leading) {
+                                    LinearGradient(
+                                        colors: [Color.white.opacity(0.05), Color.white.opacity(0.20)],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                    .frame(width: fillWidth)
+                                }
+                                .overlay(alignment: .leading) {
+                                    LinearGradient(
+                                        colors: [Color.white.opacity(0.10), .clear],
+                                        startPoint: .top,
+                                        endPoint: .bottom
+                                    )
+                                    .frame(width: fillWidth)
+                                }
+                                .shadow(color: scaleColor(index: activeSegmentIndex).opacity(0.40), radius: 7, x: 0, y: 0)
+                                .shadow(color: Color.white.opacity(0.18), radius: 3, x: 0, y: 0)
                         }
                     }
                     .frame(height: layout.categoryBarHeight)
+                    Rectangle()
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color.black.opacity(0.46),
+                                    Color.black.opacity(0.34)
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .overlay {
+                            LinearGradient(
+                                colors: scalePalette.map { $0.opacity(0.32) },
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        }
+                        .frame(height: 1)
 
                     HStack(spacing: 0) {
                         ForEach(Array(scaleSegments.enumerated()), id: \.offset) { index, segment in
                             Text(segment)
                                 .font(.caption2.weight(.medium))
-                                .foregroundStyle(.white.opacity(0.9))
+                                .foregroundStyle(.white.opacity(0.75))
                                 .frame(maxWidth: .infinity)
                                 .frame(height: layout.categoryScaleHeight)
-                                .background(scaleColor(index: index).opacity(0.42))
+                                .background(scaleColor(index: index).opacity(0.24))
                         }
                     }
                 }
