@@ -183,6 +183,9 @@ final class AtlantaAllergyPollenService: PollenReportProviding {
     private func loadHTML(from url: URL) async throws -> String {
         var request = URLRequest(url: url)
         request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
         request.timeoutInterval = perRequestTimeoutSeconds
 
         let (data, response) = try await session.data(for: request)
