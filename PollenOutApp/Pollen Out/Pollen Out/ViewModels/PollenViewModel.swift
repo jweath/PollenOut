@@ -17,7 +17,7 @@ final class PollenViewModel: ObservableObject {
     private let cache: PollenCache
     private let lastAccessedKey = "lastAccessedDate"
     private let calendar = Calendar(identifier: .gregorian)
-    private let fetchTimeoutSeconds: Double = 35
+    private let fetchTimeoutSeconds: Double = 75
     private let initialFetchTimeoutSeconds: Double = 75
     private let refreshTimeoutMessage = "Refresh timed out. Please try again."
     private let connectivityMessage = "Couldn't reach the pollen source. Check your connection and try again."

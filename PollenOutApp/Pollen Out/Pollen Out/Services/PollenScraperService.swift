@@ -31,6 +31,8 @@ final class AtlantaAllergyPollenService: PollenReportProviding {
     private let calendar = Calendar(identifier: .gregorian)
     private let perRequestTimeoutSeconds: TimeInterval = 12
     private let fetchBudgetSeconds: TimeInterval = 25
+    private let maxRequestAttempts = 3
+    private let retryBackoffNanoseconds: [UInt64] = [350_000_000, 800_000_000]
 
     init(session: URLSession = .shared) {
         self.session = session
@@ -38,46 +40,52 @@ final class AtlantaAllergyPollenService: PollenReportProviding {
 
     func fetchLatestReport() async throws -> PollenReport {
         let fetchStart = Date()
-        let mainHTML = try await loadHTML(from: baseURL)
-        let mainDocument = try SwiftSoup.parse(mainHTML)
         let today = calendar.startOfDay(for: Date())
+        var attemptDiagnostics: [String] = []
+        var candidateLinks: [(date: Date, url: URL)] = []
 
-        // Fast path: many source pages include the latest report directly on /pollen_counts.
-        if let mainCount = parseOverallCountInDocument(mainDocument),
-           var report = parseReport(
-                document: mainDocument,
-                sourceURL: baseURL,
-                fallbackDate: today,
-                fallbackOverallCount: mainCount
-           ) {
-            let trend = parseTrendPoints(
-                in: mainDocument,
-                fallbackDate: report.date,
-                fallbackCount: report.overallCount,
-                limit: 5
-            )
-            report = PollenReport(
-                date: report.date,
-                sourceURL: baseURL,
-                overallCount: report.overallCount,
-                categories: report.categories,
-                treeTopContributors: report.treeTopContributors,
-                weedTopContributors: report.weedTopContributors,
-                moldActivity: report.moldActivity,
-                recentTrend: trend
-            )
-            return report
+        do {
+            let mainHTML = try await loadHTML(from: baseURL)
+            let mainDocument = try SwiftSoup.parse(mainHTML)
+
+            // Fast path: many source pages include the latest report directly on /pollen_counts.
+            if let mainCount = parseOverallCountInDocument(mainDocument),
+               var report = parseReport(
+                    document: mainDocument,
+                    sourceURL: baseURL,
+                    fallbackDate: today,
+                    fallbackOverallCount: mainCount
+               ) {
+                let trend = parseTrendPoints(
+                    in: mainDocument,
+                    fallbackDate: report.date,
+                    fallbackCount: report.overallCount,
+                    limit: 5
+                )
+                report = PollenReport(
+                    date: report.date,
+                    sourceURL: baseURL,
+                    overallCount: report.overallCount,
+                    categories: report.categories,
+                    treeTopContributors: report.treeTopContributors,
+                    weedTopContributors: report.weedTopContributors,
+                    moldActivity: report.moldActivity,
+                    recentTrend: trend
+                )
+                return report
+            }
+
+            candidateLinks = extractReportLinks(from: mainDocument, baseURL: baseURL)
+        } catch {
+            attemptDiagnostics.append("\(baseURL.absoluteString) -> \(compactErrorDescription(error))")
         }
 
-        let candidateLinks = extractReportLinks(from: mainDocument, baseURL: baseURL)
         var latestReport: PollenReport?
         var latestDocument: Document?
-        var attemptDiagnostics: [String] = []
         var prioritizedCandidates: [(date: Date, url: URL)] = []
 
         for dayOffset in 0...10 {
             guard let date = calendar.date(byAdding: .day, value: -dayOffset, to: today) else { continue }
-            if calendar.isDateInWeekend(date) { continue }
             prioritizedCandidates.append((date, reportURLForDate(date)))
         }
 
@@ -181,22 +189,55 @@ final class AtlantaAllergyPollenService: PollenReportProviding {
     }
 
     private func loadHTML(from url: URL) async throws -> String {
-        var request = URLRequest(url: url)
-        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
-        request.timeoutInterval = perRequestTimeoutSeconds
+        var lastError: Error?
 
-        let (data, response) = try await session.data(for: request)
-        if let httpResponse = response as? HTTPURLResponse, !(200...299).contains(httpResponse.statusCode) {
-            throw URLError(.badServerResponse)
+        for attempt in 0..<maxRequestAttempts {
+            do {
+                var request = URLRequest(url: url)
+                request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+                request.cachePolicy = .reloadIgnoringLocalCacheData
+                request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+                request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+                request.timeoutInterval = perRequestTimeoutSeconds
+
+                let (data, response) = try await session.data(for: request)
+                if let httpResponse = response as? HTTPURLResponse, !(200...299).contains(httpResponse.statusCode) {
+                    throw URLError(.badServerResponse)
+                }
+
+                guard let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii) else {
+                    throw URLError(.cannotDecodeRawData)
+                }
+                return html
+            } catch {
+                lastError = error
+                guard let urlError = error as? URLError, isTransientNetworkError(urlError), attempt < (maxRequestAttempts - 1) else {
+                    throw error
+                }
+
+                if attempt < retryBackoffNanoseconds.count {
+                    try await Task.sleep(nanoseconds: retryBackoffNanoseconds[attempt])
+                }
+            }
         }
 
-        guard let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii) else {
-            throw URLError(.cannotDecodeRawData)
+        throw lastError ?? URLError(.unknown)
+    }
+
+    private func isTransientNetworkError(_ error: URLError) -> Bool {
+        switch error.code {
+        case .timedOut,
+             .networkConnectionLost,
+             .cannotFindHost,
+             .cannotConnectToHost,
+             .dnsLookupFailed,
+             .secureConnectionFailed,
+             .serverCertificateUntrusted,
+             .serverCertificateHasBadDate:
+            return true
+        default:
+            return false
         }
-        return html
     }
 
     private func compactErrorDescription(_ error: Error) -> String {
@@ -550,8 +591,6 @@ final class AtlantaAllergyPollenService: PollenReportProviding {
                 guard let date = calendar.date(byAdding: .day, value: -dayOffset, to: probeStartDate) else { continue }
                 let key = isoDateOnly(date)
                 if seenDates.contains(key) { continue }
-                // Reports are typically weekdays; skipping weekends avoids false misses and noisy failures.
-                if calendar.isDateInWeekend(date) { continue }
 
                 let url = reportURLForDate(date)
                 fallbackCandidates.append((date, url))

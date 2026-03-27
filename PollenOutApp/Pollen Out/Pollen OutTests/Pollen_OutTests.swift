@@ -9,6 +9,7 @@ import Foundation
 import Testing
 @testable import Pollen_Out
 
+@Suite(.serialized)
 struct Pollen_OutTests {
     @Test @MainActor
     func loadInitialData_refreshesWhenCachedReportIsFromPriorDay() async throws {
@@ -92,6 +93,132 @@ struct Pollen_OutTests {
         #expect(report.overallCount == 4650)
     }
 
+    @Test
+    func fetchLatestReport_whenWeekendHasData_prefersWeekendOverOlderWeekday() async throws {
+        let calendar = Calendar(identifier: .gregorian)
+        let today = calendar.startOfDay(for: Date())
+        let priorWeekendDay = try #require(mostRecentWeekendDay(before: today, calendar: calendar))
+        let priorWeekday = try #require(mostRecentWeekday(before: priorWeekendDay, calendar: calendar))
+        let secondWeekendDay = calendar.date(byAdding: .day, value: -1, to: priorWeekendDay)
+            .flatMap { calendar.isDateInWeekend($0) ? $0 : nil }
+
+        let baseURL = URL(string: "https://www.atlantaallergy.com/pollen_counts")!
+        let todayNoDataURL = reportURL(for: today, calendar: calendar)
+        let weekendURL = reportURL(for: priorWeekendDay, calendar: calendar)
+        let weekdayURL = reportURL(for: priorWeekday, calendar: calendar)
+        let secondWeekendURL = secondWeekendDay.map { reportURL(for: $0, calendar: calendar) }
+
+        let noDataHTML = """
+        <html><body>
+        <p>There is no pollen data for \(monthDayYearString(today))</p>
+        <a href="\(todayNoDataURL.path)">3</a>
+        <a href="\(weekendURL.path)">2,792</a>
+        \(secondWeekendURL.map { "<a href=\"\($0.path)\">1,876</a>" } ?? "")
+        <a href="\(weekdayURL.path)">245</a>
+        </body></html>
+        """
+
+        let weekendHTML = """
+        <html><body>
+        <h3>Total Pollen Count for \(monthDayYearString(priorWeekendDay)): 2,792</h3>
+        <a href="\(weekendURL.path)">2792</a>
+        \(secondWeekendURL.map { "<a href=\"\($0.path)\">1876</a>" } ?? "")
+        <a href="\(weekdayURL.path)">245</a>
+        </body></html>
+        """
+
+        let weekdayHTML = """
+        <html><body>
+        <h3>Total Pollen Count for \(monthDayYearString(priorWeekday)): 245</h3>
+        </body></html>
+        """
+
+        var responseByURL: [URL: String] = [
+            baseURL: noDataHTML,
+            todayNoDataURL: noDataHTML,
+            weekendURL: weekendHTML,
+            weekdayURL: weekdayHTML
+        ]
+        if let secondWeekendDay, let secondWeekendURL {
+            responseByURL[secondWeekendURL] = """
+            <html><body>
+            <h3>Total Pollen Count for \(monthDayYearString(secondWeekendDay)): 1,876</h3>
+            </body></html>
+            """
+        }
+
+        let session = makeSession(responseByURL: responseByURL)
+        let service = AtlantaAllergyPollenService(session: session)
+
+        let report = try await service.fetchLatestReport()
+
+        let expectedDate = calendar.startOfDay(for: priorWeekendDay)
+        #expect(calendar.startOfDay(for: report.date) == expectedDate)
+        #expect(report.overallCount == 2792)
+    }
+
+    @Test
+    func fetchLatestReport_whenBasePageTimesOutOnce_retriesAndSucceeds() async throws {
+        let baseURL = URL(string: "https://www.atlantaallergy.com/pollen_counts")!
+        let today = Calendar(identifier: .gregorian).startOfDay(for: Date())
+        let expectedCount = 2792
+        let html = """
+        <html><body>
+        <h3>Total Pollen Count for \(monthDayYearString(today)): 2,792</h3>
+        </body></html>
+        """
+
+        let session = makeSession(
+            responseByURL: [:],
+            scriptedResponsesByURL: [
+                baseURL: [
+                    .failure(URLError(.timedOut)),
+                    .success(html)
+                ]
+            ]
+        )
+        let service = AtlantaAllergyPollenService(session: session)
+
+        let report = try await service.fetchLatestReport()
+
+        #expect(report.sourceURL == baseURL)
+        #expect(report.overallCount == expectedCount)
+    }
+
+    @Test
+    func fetchLatestReport_whenBasePageAlwaysTimesOut_fallsBackToDatedURLs() async throws {
+        let calendar = Calendar(identifier: .gregorian)
+        let today = calendar.startOfDay(for: Date())
+        let baseURL = URL(string: "https://www.atlantaallergy.com/pollen_counts")!
+        let todayURL = reportURL(for: today, calendar: calendar)
+        let expectedCount = 6563
+        let todayHTML = """
+        <html><body>
+        <h3>Total Pollen Count for \(monthDayYearString(today)): 6,563</h3>
+        </body></html>
+        """
+
+        let session = makeSession(
+            responseByURL: [
+                todayURL: todayHTML
+            ],
+            scriptedResponsesByURL: [
+                baseURL: [
+                    .failure(URLError(.timedOut)),
+                    .failure(URLError(.timedOut)),
+                    .failure(URLError(.timedOut))
+                ]
+            ]
+        )
+        let service = AtlantaAllergyPollenService(session: session)
+
+        let report = try await service.fetchLatestReport()
+
+        #expect(calendar.startOfDay(for: report.date) == today)
+        #expect(report.overallCount == expectedCount)
+        #expect(report.sourceURL == todayURL)
+    }
+
     private func makeReport(date: Date, overallCount: Int) -> PollenReport {
         PollenReport(
             date: date,
@@ -115,8 +242,12 @@ struct Pollen_OutTests {
         return PollenCache(fileURL: tempDirectory.appendingPathComponent("latest_pollen_report.json"))
     }
 
-    private func makeSession(responseByURL: [URL: String]) -> URLSession {
+    private func makeSession(
+        responseByURL: [URL: String],
+        scriptedResponsesByURL: [URL: [MockURLProtocol.MockResponse]] = [:]
+    ) -> URLSession {
         MockURLProtocol.responseByURL = responseByURL
+        MockURLProtocol.scriptedResponsesByURL = scriptedResponsesByURL
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
         return URLSession(configuration: configuration)
@@ -129,6 +260,42 @@ struct Pollen_OutTests {
         components.month = 3
         components.day = 16
         return components.date!
+    }
+
+    private func reportURL(for date: Date, calendar: Calendar) -> URL {
+        let year = calendar.component(.year, from: date)
+        let month = calendar.component(.month, from: date)
+        let day = calendar.component(.day, from: date)
+        return URL(string: "https://www.atlantaallergy.com/pollen_counts/index/\(year)/\(String(format: "%02d", month))/\(String(format: "%02d", day))")!
+    }
+
+    private func monthDayYearString(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "MM/dd/yyyy"
+        return formatter.string(from: date)
+    }
+
+    private func mostRecentWeekendDay(before date: Date, calendar: Calendar) -> Date? {
+        for dayOffset in 1...14 {
+            guard let candidate = calendar.date(byAdding: .day, value: -dayOffset, to: date) else { continue }
+            if calendar.isDateInWeekend(candidate) {
+                return calendar.startOfDay(for: candidate)
+            }
+        }
+        return nil
+    }
+
+    private func mostRecentWeekday(before date: Date, calendar: Calendar) -> Date? {
+        for dayOffset in 1...7 {
+            guard let candidate = calendar.date(byAdding: .day, value: -dayOffset, to: date) else { continue }
+            if !calendar.isDateInWeekend(candidate) {
+                return calendar.startOfDay(for: candidate)
+            }
+        }
+        return nil
     }
 }
 
@@ -161,7 +328,14 @@ private actor MockPollenService: PollenReportProviding {
 }
 
 private final class MockURLProtocol: URLProtocol {
+    enum MockResponse {
+        case success(String)
+        case failure(URLError)
+    }
+
+    private static let lock = NSLock()
     static var responseByURL: [URL: String] = [:]
+    static var scriptedResponsesByURL: [URL: [MockResponse]] = [:]
 
     override class func canInit(with request: URLRequest) -> Bool {
         true
@@ -172,10 +346,44 @@ private final class MockURLProtocol: URLProtocol {
     }
 
     override func startLoading() {
-        guard let url = request.url,
-              let body = Self.responseByURL[url],
-              let data = body.data(using: .utf8) else {
+        guard let url = request.url else {
             client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+
+        if let scripted = nextScriptedResponse(for: url) {
+            switch scripted {
+            case .failure(let error):
+                client?.urlProtocol(self, didFailWithError: error)
+                return
+            case .success(let body):
+                respondWithHTML(body, for: url)
+                return
+            }
+        }
+
+        guard let body = Self.responseByURL[url] else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+
+        respondWithHTML(body, for: url)
+    }
+
+    private func nextScriptedResponse(for url: URL) -> MockResponse? {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        guard var queue = Self.scriptedResponsesByURL[url], !queue.isEmpty else {
+            return nil
+        }
+        let first = queue.removeFirst()
+        Self.scriptedResponsesByURL[url] = queue
+        return first
+    }
+
+    private func respondWithHTML(_ body: String, for url: URL) {
+        guard let data = body.data(using: .utf8) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.cannotDecodeRawData))
             return
         }
 

@@ -154,7 +154,7 @@ struct TrendChartView: View {
     }
 
     private func labelOpacity(for point: DisplayPoint) -> Double {
-        if calendar.isDateInWeekend(point.date) { return 0.45 }
+        if calendar.isDateInWeekend(point.date) && !point.hasData { return 0.45 }
         return point.hasData ? 0.9 : 0.6
     }
 
