@@ -7,6 +7,8 @@ struct MainScreenView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var viewModel = PollenViewModel()
     @State private var didTriggerInitialLoad = false
+    @State private var didStartInitialDataLoad = false
+    @State private var isShowingSettings = false
     private let pollenPageURL = URL(string: "https://www.atlantaallergy.com/pollen_counts")!
 
     var body: some View {
@@ -31,11 +33,60 @@ struct MainScreenView: View {
                                 overallCard(report, layout: layout)
                                 TrendChartView(points: report.recentTrend, layout: layout)
                                 categorySection(report, layout: layout)
-                            } else if viewModel.isLoading {
-                                ProgressView("Loading latest report...")
-                                    .tint(.white)
-                                    .foregroundStyle(.white)
-                                    .frame(maxWidth: .infinity, minHeight: 220)
+                            } else if viewModel.shouldShowInitialNotificationPrompt || viewModel.isLoading {
+                                VStack(spacing: 14) {
+                                    if viewModel.isLoading {
+                                        ProgressView()
+                                            .tint(.white)
+                                    }
+
+                                    Text(viewModel.isLoading
+                                         ? "Fetching pollen report..."
+                                         : "While we're preparing your first pollen report...")
+                                        .font(.headline.weight(.semibold))
+                                        .foregroundStyle(.white)
+                                        .multilineTextAlignment(.center)
+
+                                    Text("Want to receive a single daily notification with the latest overall pollen count and top contributors?")
+                                        .font(.subheadline)
+                                        .foregroundStyle(.white.opacity(0.85))
+                                        .multilineTextAlignment(.center)
+
+                                    if viewModel.shouldShowInitialNotificationPrompt {
+                                        VStack(spacing: 24) {
+                                            Button {
+                                                Task {
+                                                    await viewModel.enableNotificationsFromInitialPrompt()
+                                                    await startInitialDataLoadIfNeeded()
+                                                }
+                                            } label: {
+                                                Text("Enable Notifications")
+                                                    .font(.subheadline.weight(.semibold))
+                                                    .frame(maxWidth: .infinity)
+                                                    .padding(.horizontal, 18)
+                                                    .padding(.vertical, 14)
+                                                    .background(.white.opacity(0.2))
+                                                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                            }
+                                            .foregroundStyle(.white)
+
+                                            Button {
+                                                viewModel.dismissInitialNotificationPrompt()
+                                                Task {
+                                                    await startInitialDataLoadIfNeeded()
+                                                }
+                                            } label: {
+                                                Text("Don't Enable Notifications")
+                                                    .font(.subheadline)
+                                                    .multilineTextAlignment(.center)
+                                            }
+                                            .foregroundStyle(.white.opacity(0.82))
+                                        }
+                                        .padding(.top, 8)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, minHeight: 220)
+                                .padding(.top, 24)
                             } else {
                                 VStack(spacing: 12) {
                                     Text(viewModel.errorMessage == nil
@@ -90,8 +141,9 @@ struct MainScreenView: View {
                     guard !didTriggerInitialLoad else { return }
                     didTriggerInitialLoad = true
                     Task {
-                        await viewModel.loadInitialData()
-                        await viewModel.handleAppBecameActive()
+                        await viewModel.prepareInitialNotificationPrompt()
+                        guard !viewModel.shouldShowInitialNotificationPrompt else { return }
+                        await startInitialDataLoadIfNeeded()
                     }
                 }
                 .onChange(of: scenePhase) { _, newPhase in
@@ -102,16 +154,54 @@ struct MainScreenView: View {
                 }
                 .toolbar(.hidden, for: .navigationBar)
                 .overlay(alignment: .bottom) {
-                    if let error = viewModel.errorMessage {
-                        Text(error)
-                            .font(.caption)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .background(.ultraThinMaterial)
-                            .clipShape(Capsule())
-                            .padding(.bottom, 12)
-                            .accessibilityLabel("Error: \(error)")
+                    VStack(spacing: 8) {
+                        if let error = viewModel.errorMessage {
+                            Text(error)
+                                .font(.caption)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(.ultraThinMaterial)
+                                .clipShape(Capsule())
+                                .accessibilityLabel("Error: \(error)")
+                        }
+
+                        if let warning = viewModel.notificationPermissionWarning {
+                            Text(warning)
+                                .font(.caption)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(.ultraThinMaterial)
+                                .clipShape(Capsule())
+                                .accessibilityLabel("Notification warning: \(warning)")
+                        }
+
+                        if !viewModel.shouldShowInitialNotificationPrompt {
+                            Button {
+                                isShowingSettings = true
+                            } label: {
+                                Label("Settings", systemImage: "gearshape.fill")
+                                    .font(.subheadline.weight(.semibold))
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 10)
+                                    .background(.ultraThinMaterial)
+                                    .clipShape(Capsule())
+                            }
+                            .foregroundStyle(.white)
+                            .accessibilityLabel("Open notification settings")
+                        }
                     }
+                    .padding(.bottom, 12)
+                }
+                .sheet(isPresented: $isShowingSettings) {
+                    NotificationSettingsSheet(
+                        manager: viewModel.notificationManager,
+                        onToggleNotifications: { enabled in
+                            await viewModel.setNotificationsEnabled(enabled)
+                        },
+                        onTimeChanged: { date in
+                            await viewModel.updateNotificationTime(date)
+                        }
+                    )
                 }
             }
         }
@@ -247,6 +337,72 @@ struct MainScreenView: View {
         return cleaned.joined(separator: ", ")
     }
 
+}
+
+@MainActor
+private extension MainScreenView {
+    func startInitialDataLoadIfNeeded() async {
+        guard !didStartInitialDataLoad else { return }
+        didStartInitialDataLoad = true
+        await viewModel.loadInitialData()
+        await viewModel.handleAppBecameActive()
+    }
+}
+
+private struct NotificationSettingsSheet: View {
+    @ObservedObject var manager: DailyNotificationManager
+    let onToggleNotifications: @Sendable (Bool) async -> Void
+    let onTimeChanged: @Sendable (Date) async -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Toggle(isOn: Binding(
+                        get: { manager.isEnabled },
+                        set: { newValue in
+                            Task {
+                                await onToggleNotifications(newValue)
+                            }
+                        }
+                    )) {
+                        Text("Daily Pollen Notifications")
+                    }
+                }
+
+                if manager.isEnabled {
+                    Section("Delivery Time") {
+                        DatePicker(
+                            "Notify Me",
+                            selection: Binding(
+                                get: { manager.preferredTime },
+                                set: { newValue in
+                                    Task {
+                                        await onTimeChanged(newValue)
+                                    }
+                                }
+                            ),
+                            displayedComponents: .hourAndMinute
+                        )
+                        .datePickerStyle(.wheel)
+
+                        Text("Default time is based on 10:00 AM Eastern, converted to your local timezone. Source data usually updates around 9:00 to 9:30 AM Eastern.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .navigationTitle("Settings")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
 }
 
 private extension MainScreenView {

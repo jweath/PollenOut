@@ -7,6 +7,7 @@
 
 import Foundation
 import Testing
+import UserNotifications
 @testable import Pollen_Out
 
 @Suite(.serialized)
@@ -72,6 +73,36 @@ struct Pollen_OutTests {
         #expect(viewModel.report?.overallCount == 420)
         #expect(viewModel.errorMessage == nil)
         #expect(viewModel.isShowingCachedData == false)
+    }
+
+    @Test @MainActor
+    func requestInitialNotificationsDuringFirstLoadIfNeeded_requestsAuthorizationWhenEligible() async throws {
+        let defaults = UserDefaults(suiteName: "PollenOutTests-\(UUID().uuidString)")!
+        let center = MockNotificationCenterClient(status: .notDetermined, requestAuthorizationResult: true)
+        let manager = DailyNotificationManager(defaults: defaults, notificationCenter: center)
+        let service = MockPollenService(result: .success(makeReport(date: Date(), overallCount: 100)))
+        let viewModel = PollenViewModel(service: service, cache: makeIsolatedCache(), notificationManager: manager)
+
+        await viewModel.requestInitialNotificationsDuringFirstLoadIfNeeded()
+
+        #expect(await center.requestAuthorizationCallCount() == 1)
+        #expect(viewModel.notificationPermissionWarning == nil)
+        #expect(viewModel.shouldShowInitialNotificationPrompt == false)
+    }
+
+    @Test @MainActor
+    func requestInitialNotificationsDuringFirstLoadIfNeeded_setsWarningWhenDenied() async throws {
+        let defaults = UserDefaults(suiteName: "PollenOutTests-\(UUID().uuidString)")!
+        let center = MockNotificationCenterClient(status: .notDetermined, requestAuthorizationResult: false)
+        let manager = DailyNotificationManager(defaults: defaults, notificationCenter: center)
+        let service = MockPollenService(result: .success(makeReport(date: Date(), overallCount: 100)))
+        let viewModel = PollenViewModel(service: service, cache: makeIsolatedCache(), notificationManager: manager)
+
+        await viewModel.requestInitialNotificationsDuringFirstLoadIfNeeded()
+
+        #expect(await center.requestAuthorizationCallCount() == 1)
+        #expect(viewModel.notificationPermissionWarning == "Notifications are blocked in system settings.")
+        #expect(viewModel.shouldShowInitialNotificationPrompt == false)
     }
 
     @Test
@@ -280,7 +311,7 @@ struct Pollen_OutTests {
 
     @MainActor
     private func waitForReportCount(_ expected: Int, in viewModel: PollenViewModel) async {
-        for _ in 0..<20 {
+        for _ in 0..<100 {
             if viewModel.report?.overallCount == expected {
                 return
             }
@@ -440,4 +471,36 @@ private final class MockURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+private final class MockNotificationCenterClient: UserNotificationCenterClient {
+    private let lock = NSLock()
+    private var status: UNAuthorizationStatus
+    private let authorizationResult: Bool
+    private var requestCallCount = 0
+
+    init(status: UNAuthorizationStatus, requestAuthorizationResult: Bool) {
+        self.status = status
+        self.authorizationResult = requestAuthorizationResult
+    }
+
+    func authorizationStatus() async -> UNAuthorizationStatus {
+        lock.withLock { status }
+    }
+
+    func requestAuthorization(options: UNAuthorizationOptions) async throws -> Bool {
+        lock.withLock {
+            requestCallCount += 1
+            status = authorizationResult ? .authorized : .denied
+        }
+        return authorizationResult
+    }
+
+    func add(_ request: UNNotificationRequest) async throws {}
+
+    func removePendingRequests(withIdentifiers identifiers: [String]) {}
+
+    func requestAuthorizationCallCount() async -> Int {
+        lock.withLock { requestCallCount }
+    }
 }

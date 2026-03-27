@@ -12,22 +12,28 @@ final class PollenViewModel: ObservableObject {
     @Published private(set) var isShowingCachedData = false
     @Published var errorMessage: String?
     @Published var diagnosticsText: String = ""
+    @Published private(set) var notificationPermissionWarning: String?
+    @Published private(set) var shouldShowInitialNotificationPrompt = false
 
     private let serviceExecutor: ServiceExecutor
     private let cache: PollenCache
+    let notificationManager: DailyNotificationManager
     private let lastAccessedKey = "lastAccessedDate"
     private let calendar = Calendar(identifier: .gregorian)
     private let fetchTimeoutSeconds: Double = 75
     private let initialFetchTimeoutSeconds: Double = 75
     private let refreshTimeoutMessage = "Refresh timed out. Please try again."
     private let connectivityMessage = "Couldn't reach the pollen source. Check your connection and try again."
+    private var hasAttemptedInitialNotificationRequest = false
 
     init(
         service: PollenReportProviding? = nil,
-        cache: PollenCache? = nil
+        cache: PollenCache? = nil,
+        notificationManager: DailyNotificationManager? = nil
     ) {
         self.serviceExecutor = ServiceExecutor(service: service ?? AtlantaAllergyPollenService())
         self.cache = cache ?? PollenCache()
+        self.notificationManager = notificationManager ?? DailyNotificationManager()
         self.report = self.cache.load()
         self.isShowingCachedData = report != nil
     }
@@ -43,6 +49,8 @@ final class PollenViewModel: ObservableObject {
         if reportDay < today {
             await refresh()
         }
+
+        await notificationManager.handleUpdatedReport(report)
     }
 
     func handleAppBecameActive() async {
@@ -71,26 +79,15 @@ final class PollenViewModel: ObservableObject {
 
         do {
             let fetched = try await fetchReportOffMain(timeoutSeconds: timeoutSeconds)
-            report = fetched
-            errorMessage = nil
-            isShowingCachedData = false
-            diagnosticsText = """
-            Loaded report: \(fetched.sourceURL.absoluteString)
-            Report date: \(fetched.date.formatted(date: .abbreviated, time: .omitted))
-            Trend points: \(fetched.recentTrend.count)
-            Trend values (latest->oldest): \(fetched.recentTrend.sorted(by: { $0.date > $1.date }).map(\.count).map(String.init).joined(separator: ", "))
-            """
-            cache.save(report: fetched)
-            reloadWidgetTimelines()
+            applyFetchedReport(fetched)
+            await notificationManager.handleUpdatedReport(fetched)
         } catch is CancellationError {
-            // Ignore task cancellation (view lifecycle, pull-to-refresh interruptions).
-            diagnosticsText = "Fetch cancelled."
+            await recoverFromCancellation(timeoutSeconds: timeoutSeconds)
         } catch let urlError as URLError where urlError.code == .cancelled {
-            // Pull-to-refresh can cancel in-flight requests during gesture/refresh transitions.
-            diagnosticsText = "Fetch cancelled."
+            await recoverFromCancellation(timeoutSeconds: timeoutSeconds)
         } catch let nsError as NSError
             where nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
-            diagnosticsText = "Fetch cancelled."
+            await recoverFromCancellation(timeoutSeconds: timeoutSeconds)
         } catch let urlError as URLError where urlError.code == .timedOut {
             errorMessage = refreshTimeoutMessage
             diagnosticsText = "Fetch timed out:\n\(urlError.localizedDescription)"
@@ -136,6 +133,61 @@ final class PollenViewModel: ObservableObject {
 
     private func fetchReportOffMain(timeoutSeconds: Double) async throws -> PollenReport {
         let executor = serviceExecutor
+        return try await Self.fetchReport(executor: executor, timeoutSeconds: timeoutSeconds)
+    }
+
+    private func recoverFromCancellation(timeoutSeconds: Double) async {
+        diagnosticsText = "Fetch interrupted. Retrying..."
+
+        if Task.isCancelled {
+            retryRefreshAfterCancellation(timeoutSeconds: timeoutSeconds)
+            return
+        }
+
+        do {
+            let fetched = try await fetchReportOffMain(timeoutSeconds: timeoutSeconds)
+            applyFetchedReport(fetched)
+            await notificationManager.handleUpdatedReport(fetched)
+        } catch {
+            diagnosticsText = "Fetch cancelled."
+        }
+    }
+
+    private func retryRefreshAfterCancellation(timeoutSeconds: Double) {
+        let executor = serviceExecutor
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            do {
+                let fetched = try await Self.fetchReport(executor: executor, timeoutSeconds: timeoutSeconds)
+                await MainActor.run {
+                    self.applyFetchedReport(fetched)
+                    Task {
+                        await self.notificationManager.handleUpdatedReport(fetched)
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.diagnosticsText = "Fetch cancelled."
+                }
+            }
+        }
+    }
+
+    private func applyFetchedReport(_ fetched: PollenReport) {
+        report = fetched
+        errorMessage = nil
+        isShowingCachedData = false
+        diagnosticsText = """
+        Loaded report: \(fetched.sourceURL.absoluteString)
+        Report date: \(fetched.date.formatted(date: .abbreviated, time: .omitted))
+        Trend points: \(fetched.recentTrend.count)
+        Trend values (latest->oldest): \(fetched.recentTrend.sorted(by: { $0.date > $1.date }).map(\.count).map(String.init).joined(separator: ", "))
+        """
+        cache.save(report: fetched)
+        reloadWidgetTimelines()
+    }
+
+    private static func fetchReport(executor: ServiceExecutor, timeoutSeconds: Double) async throws -> PollenReport {
         return try await withThrowingTaskGroup(of: PollenReport.self) { group in
             group.addTask(priority: .userInitiated) {
                 try await executor.service.fetchLatestReport()
@@ -151,6 +203,62 @@ final class PollenViewModel: ObservableObject {
             group.cancelAll()
             return first
         }
+    }
+
+    func setNotificationsEnabled(_ enabled: Bool) async {
+        await notificationManager.setEnabled(enabled)
+        if enabled && !notificationManager.isEnabled {
+            notificationPermissionWarning = "Notifications are blocked in system settings."
+        } else {
+            notificationPermissionWarning = nil
+        }
+
+        if let report {
+            await notificationManager.handleUpdatedReport(report)
+        }
+    }
+
+    func updateNotificationTime(_ value: Date) async {
+        notificationManager.updatePreferredTime(value)
+        if let report {
+            await notificationManager.handleUpdatedReport(report)
+        }
+    }
+
+    func prepareInitialNotificationPrompt() async {
+        shouldShowInitialNotificationPrompt = await notificationManager.shouldShowInitialInstallPrompt()
+    }
+
+    func requestInitialNotificationsDuringFirstLoadIfNeeded() async {
+        guard !hasAttemptedInitialNotificationRequest else { return }
+        hasAttemptedInitialNotificationRequest = true
+
+        let shouldPrompt = await notificationManager.shouldShowInitialInstallPrompt()
+        shouldShowInitialNotificationPrompt = shouldPrompt
+        guard shouldPrompt else { return }
+
+        let granted = await notificationManager.enableFromInitialInstallPrompt()
+        shouldShowInitialNotificationPrompt = false
+        notificationPermissionWarning = granted ? nil : "Notifications are blocked in system settings."
+
+        if granted, let report {
+            await notificationManager.handleUpdatedReport(report)
+        }
+    }
+
+    func enableNotificationsFromInitialPrompt() async {
+        let granted = await notificationManager.enableFromInitialInstallPrompt()
+        shouldShowInitialNotificationPrompt = false
+        notificationPermissionWarning = granted ? nil : "Notifications are blocked in system settings."
+
+        if granted, let report {
+            await notificationManager.handleUpdatedReport(report)
+        }
+    }
+
+    func dismissInitialNotificationPrompt() {
+        notificationManager.dismissInitialInstallPrompt()
+        shouldShowInitialNotificationPrompt = false
     }
 }
 
