@@ -49,6 +49,31 @@ struct Pollen_OutTests {
         #expect(viewModel.errorMessage == "Refresh timed out. Please try again.")
     }
 
+    @Test @MainActor
+    func refresh_whenInitialFetchIsCancelled_retriesAndPublishesNewReport() async throws {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: "lastAccessedDate")
+
+        let cache = makeIsolatedCache()
+        let staleDate = Calendar(identifier: .gregorian).date(byAdding: .day, value: -1, to: Date())!
+        cache.save(report: makeReport(date: staleDate, overallCount: 150))
+
+        let freshReport = makeReport(date: Date(), overallCount: 420)
+        let service = MockPollenService(results: [
+            .failure(URLError(.cancelled)),
+            .success(freshReport)
+        ])
+        let viewModel = PollenViewModel(service: service, cache: cache)
+
+        await viewModel.refresh()
+        await waitForReportCount(420, in: viewModel)
+
+        #expect(await service.fetchCount() == 2)
+        #expect(viewModel.report?.overallCount == 420)
+        #expect(viewModel.errorMessage == nil)
+        #expect(viewModel.isShowingCachedData == false)
+    }
+
     @Test
     func fetchLatestReport_whenTodayPageSaysNoData_usesMostRecentAvailableDay() async throws {
         let baseURL = URL(string: "https://www.atlantaallergy.com/pollen_counts")!
@@ -253,6 +278,17 @@ struct Pollen_OutTests {
         return URLSession(configuration: configuration)
     }
 
+    @MainActor
+    private func waitForReportCount(_ expected: Int, in viewModel: PollenViewModel) async {
+        for _ in 0..<20 {
+            if viewModel.report?.overallCount == expected {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        Issue.record("Timed out waiting for report overallCount to become \(expected). Current value: \(String(describing: viewModel.report?.overallCount))")
+    }
+
     private func latestAvailableURLDate() -> Date {
         var components = DateComponents()
         components.calendar = Calendar(identifier: .gregorian)
@@ -306,14 +342,19 @@ private actor MockPollenService: PollenReportProviding {
     }
 
     private var fetchInvocationCount = 0
-    private let result: Result
+    private var results: [Result]
 
     init(result: Result) {
-        self.result = result
+        self.results = [result]
+    }
+
+    init(results: [Result]) {
+        self.results = results
     }
 
     func fetchLatestReport() async throws -> PollenReport {
         fetchInvocationCount += 1
+        let result = results.isEmpty ? .failure(URLError(.badServerResponse)) : results.removeFirst()
         switch result {
         case .success(let report):
             return report
